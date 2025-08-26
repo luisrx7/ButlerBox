@@ -53,6 +53,7 @@ ui_stop_event = threading.Event()
 # File logger (optional) initialized later in main()
 file_logger = None
 # Removed log scrolling state (always tail newest logs)
+ui_started = False  # Becomes True once Rich UI loop begins; before that, echo logs to stdout
 
 # Command input (non-blocking) state
 command_mode = None  # None | 'send_text' | 'speak_only'
@@ -108,15 +109,18 @@ def _safe_print(*args, **kwargs):
 _b.print = _safe_print  # Monkey-patch global print early
 
 def log(message: str, level: str = "INFO"):
-    """Append a message to in-memory log and optionally to rotating file."""
+    """Append a message to in-memory log and optionally to rotating file.
+    Before UI starts (or if Rich missing) also print directly so early errors are visible.
+    """
     ts = time.strftime('%H:%M:%S')
     line = f"[{ts}] {message}"
     with log_lock:
         log_buffer.append(line)
         if len(log_buffer) > LOG_LIMIT:
             del log_buffer[0:len(log_buffer)-LOG_LIMIT]
-    # Console fallback if Rich not available
-    if not RICH_AVAILABLE:
+    # Always echo to stdout until UI takes over (or if Rich not available)
+    global ui_started
+    if (not RICH_AVAILABLE) or (not ui_started):
         _orig_print(line)
     # Forward to file logger if configured
     global file_logger
@@ -317,6 +321,8 @@ def _build_layout(cfg):
 def ui_loop(cfg):
     if not RICH_AVAILABLE:
         return
+    global ui_started
+    ui_started = True
     try:
         with Live(console=console, refresh_per_second=12, screen=True) as live:
             while not ui_stop_event.is_set():
@@ -386,18 +392,40 @@ def retry_failed_uploads(cfg):
 
 def init_tts(cfg):
     """Resolve desired voice/rate from config. Each speak spawns a fresh engine thread.
-
-    This avoids long-lived engine state which previously caused one-shot behaviour.
-    Restart the program to change voice settings.
+    Adds timeout + config disable to avoid startup hang if pyttsx3 blocks.
     """
     global tts_voice_id, tts_rate
     tts_cfg = cfg.get('tts', {}) or {}
+    if tts_cfg.get('enabled', True) is False:
+        log("TTS disabled via config.")
+        return
     desired_rate = tts_cfg.get('rate')
     voice_index = tts_cfg.get('voice_index')
     voice_name = tts_cfg.get('voice_name')
+    log("TTS init starting...")
+    temp_engine = None
+
+    # Initialize engine in a helper thread with timeout to prevent indefinite hang.
+    init_result = {}
+    def _engine_init():
+        try:
+            init_result['engine'] = pyttsx3.init()
+        except Exception as e:
+            init_result['error'] = e
+
+    th = threading.Thread(target=_engine_init, daemon=True)
+    th.start()
+    th.join(timeout=3.0)
+    if th.is_alive():
+        log("⚠️  TTS init timed out (>3s). Continuing without voice discovery.")
+        return
+    if 'error' in init_result:
+        log(f"TTS init (engine create) failed: {init_result['error']}")
+        return
+
+    temp_engine = init_result.get('engine')
     try:
-        temp_engine = pyttsx3.init()
-        voices = temp_engine.getProperty('voices') or []
+        voices = (temp_engine.getProperty('voices') or []) if temp_engine else []
         chosen = None
         if voice_name:
             vn = str(voice_name).lower()
@@ -419,11 +447,11 @@ def init_tts(cfg):
     except Exception as e:
         log(f"TTS init (voice discovery) failed: {e}")
     finally:
-        try:
-            temp_engine.stop()
-        except Exception:
-            pass
-        del temp_engine
+        if temp_engine:
+            try:
+                temp_engine.stop()
+            except Exception:
+                pass
 
 def speak_text(text):
     if not text:
@@ -1380,13 +1408,33 @@ def start_webhook_listener(cfg):
 def main():
     cfg = load_config()
     _init_file_logging(cfg)
+    log("Startup: validating config...")
+    access_key = cfg.get("access_key", "")
+    wakeword_path = cfg.get("wakeword_path")
+    model_path = cfg.get("model_path")
+    if not access_key:
+        log("CONFIG ERROR: access_key missing in config.yaml")
+        return
+    if isinstance(access_key, str) and access_key.startswith("YOUR_"):
+        log("CONFIG ERROR: Replace placeholder access_key in config.yaml with your real Picovoice Access Key from console.picovoice.ai (exiting early).")
+        return
+    if not wakeword_path or not os.path.isfile(wakeword_path):
+        log(f"CONFIG ERROR: wakeword_path not found: {wakeword_path}")
+        return
+    if not model_path or not os.path.isfile(model_path):
+        log(f"CONFIG ERROR: model_path not found: {model_path}")
+        return
+
+    log("Startup: initializing TTS...")
     init_tts(cfg)
     register_global_shortcuts(cfg)
+    log("Startup: starting webhook listener + UI/keyboard threads...")
     start_webhook_listener(cfg)
     if RICH_AVAILABLE:
         threading.Thread(target=ui_loop, args=(cfg,), daemon=True).start()
     if msvcrt:
         threading.Thread(target=keyboard_loop, args=(cfg,), daemon=True).start()
+    log("Startup: entering listen loop (Ctrl+C to exit)")
     listen_loop(cfg)
     # Per-call TTS threads will exit naturally; nothing to clean.
 

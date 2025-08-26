@@ -51,3 +51,35 @@ webhook_listener:
   host: "0.0.0.0"  # Listen on all interfaces
   port: 5000        # Port for the Flask server
   endpoint: "/response"  # Path for the webhook endpoint
+  health_endpoint: "/health"       # Health check path (GET)
+  waitress_fallback: true            # Try waitress if Flask dev server fails
+  self_test: true                    # Perform loopback health check on startup
+
+# Enable rotating file logging (optional)
+logging:
+  file_enabled: true
+  file_path: "logs/app.log"
+  max_bytes: 1048576        # 1 MB before rotation
+  backup_count: 5
+  encoding: "utf-8"
+  level: INFO
+
+# Retry / backoff strategy for webhook deliveries (audio & text)
+webhook_retry:
+  max_attempts: 3
+  base_delay_seconds: 1
+  backoff_factor: 2
+  max_delay_seconds: 15
+  jitter: true
+
+# Shortcut configuration (console + optional global hotkeys)
+shortcuts:
+  use_global: false           # set true to register system-wide hotkeys (requires 'keyboard')
+  start_recording: "ctrl+s"   # manual recording start (when idle)
+  abort_recording: "ctrl+a"   # abort active recording (discard)
+  finalize_recording: "ctrl+f" # stop & upload current recording
+  send_text: "q"              # enter compose (send+tts) mode in console
+  tts_only: "v"               # enter compose (tts only) mode in console
+  retry_failed: "r"           # retry failed uploads
+  exit: "x"                   # request exit (Ctrl+C to fully stop)
+  reset_io: "m"               # reset mic + re-init TTS
