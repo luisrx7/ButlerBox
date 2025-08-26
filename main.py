@@ -124,16 +124,25 @@ def _build_layout(cfg):
         Layout(name='shell', ratio=2),
         Layout(name='shortcuts', ratio=2)
     )
-    # Logs (always show tail)
-    max_lines = 400
+    # Logs (auto-tail). Estimate how many lines can fit: use console height and allocate ~70% to logs ratio wise.
+    try:
+        term_h = console.size.height if console else 40
+    except Exception:
+        term_h = 40
+    # Layout: root split into logs (ratio 7) + bottom (ratio 3) => logs ≈ 7/10 of screen minus panel borders (2) and maybe title line.
+    est_visible = max(5, int(term_h * 0.7) - 3)
+    max_lines = min(800, est_visible)  # never exceed LOG_LIMIT window
     with log_lock:
         total = len(log_buffer)
         if total == 0:
             logs_text = "(no logs yet)"
         else:
-            start = max(0, total - max_lines)
+            # Always tail the last max_lines lines
+            start = total - max_lines
+            if start < 0:
+                start = 0
             logs_text = "\n".join(log_buffer[start:total])
-    layout['logs'].update(Panel(logs_text, title='Logs', border_style='cyan', box=box.ROUNDED))
+    layout['logs'].update(Panel(logs_text, title=f'Logs', border_style='cyan', box=box.ROUNDED))
     # Shell / current input
     with command_lock:
         mode = command_mode
@@ -149,13 +158,13 @@ def _build_layout(cfg):
     sc_cfg = cfg.get('shortcuts', {}) or {}
     entries = []
     # General commands
-    entries.append("<q> send text")
-    entries.append("<v> playback tts")
-    entries.append("<r> retry failed")
-    entries.append("<x> exit")
-    entries.append("<m> reset mic+spk")
-    entries.append("<Alt+I|i> next input dev")
-    entries.append("<Alt+O|o> next output dev")
+    entries.append("<q> ✉️ send")
+    entries.append("<v> 🔊 tts")
+    entries.append("<r> 🔁 retry")
+    entries.append("<x> ❌ exit")
+    entries.append("<m> ♻️ reset I/O")
+    entries.append("<i/Alt+I> 🎤 next in")
+    entries.append("<o/Alt+O> 🔈 next out")
     # Recording shortcuts
     if sc_cfg.get('start_recording'): entries.append(f"<{sc_cfg.get('start_recording')}> start")
     if sc_cfg.get('abort_recording'): entries.append(f"<{sc_cfg.get('abort_recording')}> abort")
@@ -1104,8 +1113,7 @@ def keyboard_loop(cfg):
                     cycle_output_device_request = True
                     log("Cycle output device requested (Alt+O)")
                     continue
-                else:
-                    log(f"(Alt scan {alt_scan} ignored; unknown)")
+                # Unknown Alt scan ignored
             if ch == '\r':  # Enter
                 with command_lock:
                     mode = command_mode
