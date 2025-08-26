@@ -16,6 +16,7 @@ from datetime import datetime, UTC
 from flask import Flask, request, jsonify
 import pyttsx3
 import logging
+from logging.handlers import RotatingFileHandler
 try:
     import pythoncom  # For COM initialization in each TTS thread on Windows
 except ImportError:
@@ -49,6 +50,8 @@ log_lock = threading.Lock()
 log_buffer = []  # store log lines
 LOG_LIMIT = 800
 ui_stop_event = threading.Event()
+# File logger (optional) initialized later in main()
+file_logger = None
 # Removed log scrolling state (always tail newest logs)
 
 # Command input (non-blocking) state
@@ -97,17 +100,61 @@ def _safe_print(*args, **kwargs):
         _orig_print(*args, **kwargs)
 _b.print = _safe_print  # Monkey-patch global print early
 
-def log(message: str):
-    """Append a message to in-memory log (and print fallback if Rich not active)."""
+def log(message: str, level: str = "INFO"):
+    """Append a message to in-memory log and optionally to rotating file."""
     ts = time.strftime('%H:%M:%S')
     line = f"[{ts}] {message}"
     with log_lock:
         log_buffer.append(line)
         if len(log_buffer) > LOG_LIMIT:
             del log_buffer[0:len(log_buffer)-LOG_LIMIT]
+    # Console fallback if Rich not available
     if not RICH_AVAILABLE:
-        # fallback plain print using original print to avoid recursion
         _orig_print(line)
+    # Forward to file logger if configured
+    global file_logger
+    if file_logger:
+        lvl = level.upper()
+        if lvl == 'DEBUG':
+            file_logger.debug(message)
+        elif lvl == 'WARNING':
+            file_logger.warning(message)
+        elif lvl == 'ERROR':
+            file_logger.error(message)
+        elif lvl == 'CRITICAL':
+            file_logger.critical(message)
+        else:
+            file_logger.info(message)
+
+def _init_file_logging(cfg):
+    global file_logger
+    lg_cfg = (cfg or {}).get('logging') or {}
+    if not lg_cfg.get('file_enabled', False):
+        return
+    path = lg_cfg.get('file_path', 'logs/app.log')
+    max_bytes = int(lg_cfg.get('max_bytes', 1_048_576))
+    backup_count = int(lg_cfg.get('backup_count', 5))
+    encoding = lg_cfg.get('encoding', 'utf-8')
+    level_name = str(lg_cfg.get('level', 'INFO')).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    # Ensure directory exists
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count, encoding=encoding)
+        fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        handler.setFormatter(fmt)
+        logger = logging.getLogger('persistent')
+        logger.setLevel(level)
+        # Avoid duplicate handlers on re-init
+        if not any(isinstance(h, RotatingFileHandler) and getattr(h, 'baseFilename', None) == handler.baseFilename for h in logger.handlers):
+            logger.addHandler(handler)
+        file_logger = logger
+        logger.info('File logging initialized.')
+    except Exception as e:
+        _orig_print(f"Failed to init file logging: {e}")
 
 def _build_layout(cfg):
     layout = Layout(name='root')
@@ -157,29 +204,31 @@ def _build_layout(cfg):
     # Shortcuts panel
     sc_cfg = cfg.get('shortcuts', {}) or {}
     entries = []
+    def _fmt_key(label: str) -> str:
+        # Wrap a key or key-combo label (already without surrounding brackets) with colored angle brackets
+        return f"[blue]<[/blue]{label}[blue]>[/blue]"
     # General commands (configurable letters)
     send_key = sc_cfg.get('send_text', 'q') or 'q'
     tts_key = sc_cfg.get('tts_only', 'v') or 'v'
     retry_key = sc_cfg.get('retry_failed', 'r') or 'r'
     exit_key = sc_cfg.get('exit', 'x') or 'x'
     reset_key = sc_cfg.get('reset_io', 'm') or 'm'
-    entries.append(f"<{send_key}> ✉️ send")
-    entries.append(f"<{tts_key}> 🔊 tts")
-    entries.append(f"<{retry_key}> 🔁 retry")
-    entries.append(f"<{exit_key}> ❌ exit")
-    entries.append(f"<{reset_key}> ♻️ reset I/O")
-    entries.append("<i/Alt+I> 🎤 next in")
-    entries.append("<o/Alt+O> 🔈 next out")
+    entries.append(f"{_fmt_key(send_key)} send ✉️")
+    entries.append(f"{_fmt_key(tts_key)} tts 🔊")
+    entries.append(f"{_fmt_key(retry_key)} retry 🔁")
+    entries.append(f"{_fmt_key(exit_key)} exit ❌")
+    entries.append(f"{_fmt_key(reset_key)} reset I/O")
+    entries.append(f"{_fmt_key('i/Alt+I')} cycle 🎤")
+    entries.append(f"{_fmt_key('o/Alt+O')} cycle 🔈")
     # Recording shortcuts
-    if sc_cfg.get('start_recording'): entries.append(f"<{sc_cfg.get('start_recording')}> start")
-    if sc_cfg.get('abort_recording'): entries.append(f"<{sc_cfg.get('abort_recording')}> abort")
-    if sc_cfg.get('finalize_recording'): entries.append(f"<{sc_cfg.get('finalize_recording')}> send")
-    entries.append(f"[global] {'on' if sc_cfg.get('use_global') else 'off'}")
+    if sc_cfg.get('start_recording'): entries.append(f"{_fmt_key(sc_cfg.get('start_recording'))} start")
+    if sc_cfg.get('abort_recording'): entries.append(f"{_fmt_key(sc_cfg.get('abort_recording'))} abort")
+    if sc_cfg.get('finalize_recording'): entries.append(f"{_fmt_key(sc_cfg.get('finalize_recording'))} send")
     # Compress into three lines for readability
     if entries:
         per_line = (len(entries) + 2) // 3
         line1 = '  '.join(entries[:per_line])
-        line2 = '  '.join(entries[per_line:per_line*2])
+        line2 = '  '.join(entries[per_line:per_line*2]) 
         line3 = '  '.join(entries[per_line*2:])
         shortcuts_text = '\n'.join([l for l in [line1, line2, line3] if l])
     else:
@@ -1273,6 +1322,7 @@ def start_webhook_listener(cfg):
 
 def main():
     cfg = load_config()
+    _init_file_logging(cfg)
     init_tts(cfg)
     register_global_shortcuts(cfg)
     start_webhook_listener(cfg)

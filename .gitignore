@@ -2,3 +2,4 @@
 /.vscode
 /recordings/*
 /config.yaml
+/logs/*
