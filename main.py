@@ -156,37 +156,20 @@ def _build_layout(cfg):
     layout['shell'].update(Panel(shell_line, title='Shell', border_style='magenta', box=box.ROUNDED))
     # Shortcuts panel
     sc_cfg = cfg.get('shortcuts', {}) or {}
-    # Default single-key (non-global) shortcuts (user may override in config under shortcuts: ...)
-    default_user_keys = {
-        'send_text_key': 'q',
-        'tts_only_key': 'v',
-        'retry_failed_key': 'r',
-        'exit_key': 'x',
-        'reset_io_key': 'm',
-        'cycle_input_key': 'i',
-        'cycle_output_key': 'o',
-    }
-    user_keys = {}
-    warnings_local = []
-    for k, dv in default_user_keys.items():
-        raw = sc_cfg.get(k, dv)
-        if not isinstance(raw, str) or len(raw.strip()) != 1:
-            user_keys[k] = dv
-            if k in sc_cfg:
-                warnings_local.append(f"shortcut {k} invalid -> using default '{dv}'")
-        else:
-            user_keys[k] = raw.strip().lower()
-    if warnings_local:
-        for w in warnings_local:
-            log(f"⚠️ {w}")
     entries = []
-    entries.append(f"<{user_keys['send_text_key']}> ✉️ send")
-    entries.append(f"<{user_keys['tts_only_key']}> 🔊 tts")
-    entries.append(f"<{user_keys['retry_failed_key']}> 🔁 retry")
-    entries.append(f"<{user_keys['exit_key']}> ❌ exit")
-    entries.append(f"<{user_keys['reset_io_key']}> ♻️ reset I/O")
-    entries.append(f"<{user_keys['cycle_input_key']}/Alt+I> 🎤 next in")
-    entries.append(f"<{user_keys['cycle_output_key']}/Alt+O> 🔈 next out")
+    # General commands (configurable letters)
+    send_key = sc_cfg.get('send_text', 'q') or 'q'
+    tts_key = sc_cfg.get('tts_only', 'v') or 'v'
+    retry_key = sc_cfg.get('retry_failed', 'r') or 'r'
+    exit_key = sc_cfg.get('exit', 'x') or 'x'
+    reset_key = sc_cfg.get('reset_io', 'm') or 'm'
+    entries.append(f"<{send_key}> ✉️ send")
+    entries.append(f"<{tts_key}> 🔊 tts")
+    entries.append(f"<{retry_key}> 🔁 retry")
+    entries.append(f"<{exit_key}> ❌ exit")
+    entries.append(f"<{reset_key}> ♻️ reset I/O")
+    entries.append("<i/Alt+I> 🎤 next in")
+    entries.append("<o/Alt+O> 🔈 next out")
     # Recording shortcuts
     if sc_cfg.get('start_recording'): entries.append(f"<{sc_cfg.get('start_recording')}> start")
     if sc_cfg.get('abort_recording'): entries.append(f"<{sc_cfg.get('abort_recording')}> abort")
@@ -1112,33 +1095,16 @@ def keyboard_loop(cfg):
     if msvcrt is None:
         log("Keyboard interaction not available on this platform.")
         return
-    log("⌨️  Keyboard controls active (non-blocking mode). 'q'=compose send+tts, 'v'=compose tts-only, Enter=commit, Esc=cancel, r=retry uploads, x=exit notice")
+    sc_cfg = cfg.get('shortcuts', {}) or {}
+    send_key = sc_cfg.get('send_text', 'q') or 'q'
+    tts_key = sc_cfg.get('tts_only', 'v') or 'v'
+    retry_key = sc_cfg.get('retry_failed', 'r') or 'r'
+    exit_key = sc_cfg.get('exit', 'x') or 'x'
+    reset_key = sc_cfg.get('reset_io', 'm') or 'm'
+    log(f"⌨️  Keyboard: '{send_key}'=compose send+tts, '{tts_key}'=compose tts-only, Enter=commit, Esc=cancel, {retry_key}=retry uploads, {exit_key}=exit notice, {reset_key}=reset I/O")
     global command_mode, command_buffer, mic_reset_request, speaker_reset_request, cycle_input_device_request, cycle_output_device_request
     # Alt key detection (msvcrt): an initial '\x00' or '\xe0' followed by scan code.
     # We'll map scan codes for I and O (23, 24) to cycle requests.
-    # Load re-mappable keys from config
-    sc_cfg = cfg.get('shortcuts', {}) or {}
-    key_map_defaults = {
-        'send_text_key': 'q',
-        'tts_only_key': 'v',
-        'retry_failed_key': 'r',
-        'exit_key': 'x',
-        'reset_io_key': 'm',
-        'cycle_input_key': 'i',
-        'cycle_output_key': 'o',
-    }
-    key_action = {}
-    for name, default in key_map_defaults.items():
-        val = sc_cfg.get(name, default)
-        if isinstance(val, str) and len(val.strip()) == 1:
-            key_action[name] = val.strip().lower()
-        else:
-            key_action[name] = default
-    # Reverse mapping: char -> action label
-    reverse = {}
-    for act, ch in key_action.items():
-        # last one wins if conflicts; we could warn
-        reverse[ch] = act
     while True:
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
@@ -1188,27 +1154,27 @@ def keyboard_loop(cfg):
                         elif 32 <= ord(ch) < 127:
                             command_buffer.append(ch)
                     else:
-                        action = reverse.get(lower)
-                        if action == 'send_text_key':
+                        if lower == send_key.lower():
                             command_mode = 'send_text'
                             command_buffer = []
-                        elif action == 'tts_only_key':
+                        elif lower == tts_key.lower():
                             command_mode = 'speak_only'
                             command_buffer = []
-                        elif action == 'retry_failed_key':
+                        elif lower == retry_key.lower():
                             threading.Thread(target=retry_failed_uploads, args=(cfg,), daemon=True).start()
-                        elif action == 'reset_io_key':
+                        # Removed manual log scrolling shortcuts
+                        elif lower == reset_key.lower():
                             mic_reset_request = True
                             speaker_reset_request = True
                             log("Mic + Speaker reset requested")
-                        elif action == 'cycle_input_key':
-                            cycle_input_device_request = True
-                            log("Cycle input device requested")
-                        elif action == 'cycle_output_key':
-                            cycle_output_device_request = True
-                            log("Cycle output device requested")
-                        elif action == 'exit_key':
-                            log("Exiting requested by user (exit key). Press Ctrl+C to stop main loop.")
+                        # elif lower == 'i':
+                        #     cycle_input_device_request = True
+                        #     log("Cycle input device requested (i)")
+                        # elif lower == 'o':
+                        #     cycle_output_device_request = True
+                        #     log("Cycle output device requested (o)")
+                        elif lower == exit_key.lower():
+                            log("Exiting requested by user (x key). Press Ctrl+C to stop main loop.")
             # else ignore other scan codes (function keys etc.)
         time.sleep(0.05)
 
@@ -1222,6 +1188,9 @@ def start_webhook_listener(cfg):
     host = listener_cfg.get("host", "0.0.0.0")
     port = listener_cfg.get("port", 5000)
     endpoint = listener_cfg.get("endpoint", "/response")
+    health_path = listener_cfg.get("health_endpoint", "/health")
+
+    log(f"🌐 Initializing webhook listener on {host}:{port}{endpoint} (health: {health_path})")
 
     @app.route(endpoint, methods=["POST"])
     def handle_response():
@@ -1244,10 +1213,62 @@ def start_webhook_listener(cfg):
             speak_text(cleaned)
         return jsonify({"status": "success", "message": "Spoken"}), 200
 
+    @app.route(health_path, methods=["GET"])
+    def handle_health():
+        return jsonify({"status": "ok", "endpoint": endpoint}), 200
+
     # Suppress Flask default banner/log noise when using Rich full-screen UI
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    os.environ['WERKZEUG_RUN_MAIN'] = 'true'
-    threading.Thread(target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False), daemon=True).start()
+
+    def _run_flask():
+        try:
+            app.run(host=host, port=port, debug=False, use_reloader=False)
+        except OSError as e:
+            log(f"❌ Flask listener failed to bind {host}:{port}: {e}")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc(limit=6)
+            log(f"❌ Flask listener crashed: {e}\n{tb}")
+
+    # Optionally allow using waitress (more production-stable) as a fallback if Flask dev server crashes immediately
+    use_waitress_fallback = listener_cfg.get("waitress_fallback", True)
+    threading.Thread(target=_run_flask, daemon=True).start()
+
+    # Launch a watchdog to detect early failure & retry with waitress
+    if use_waitress_fallback:
+        def _watchdog():
+            # Give Flask a moment to start and pass self-test; if health still fails due to server crash, attempt waitress
+            time.sleep(1.5)
+            # If no successful health yet and port not listening, try waitress
+            try:
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    if s.connect_ex(("127.0.0.1", port)) != 0:  # not listening
+                        log("♻️ Retrying listener with waitress WSGI server...")
+                        try:
+                            from waitress import serve  # type: ignore
+                            threading.Thread(target=lambda: serve(app, host=host, port=port), daemon=True).start()
+                        except Exception as we:
+                            log(f"❌ Waitress fallback failed: {we}")
+            except Exception:
+                pass
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+    # Optional self-test (loopback) if enabled
+    if listener_cfg.get("self_test", True):
+        def _self_test():
+            time.sleep(1.0)
+            try:
+                url = f"http://127.0.0.1:{port}{health_path}"
+                r = requests.get(url, timeout=2)
+                if r.status_code == 200:
+                    log("✅ Webhook listener health OK")
+                else:
+                    log(f"⚠️ Health check non-200: {r.status_code}")
+            except Exception as e:
+                log(f"⚠️ Health check failed: {e}")
+        threading.Thread(target=_self_test, daemon=True).start()
 
 
 def main():
