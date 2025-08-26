@@ -1,0 +1,53 @@
+###############################################
+# Example configuration (sanitized for commit) #
+# Fill in real values before running.          #
+###############################################
+
+access_key: "YOUR_PICOVOICE_ACCESS_KEY"          # obtain from https://console.picovoice.ai/
+wakeword_path: "YOUR_KEYWORD_FILE.ppn"           # e.g. Alfredo_pt_windows_v3_0_0.ppn
+model_path: "porcupine_params_<lang>.pv"         # e.g. porcupine_params_pt.pv
+
+recording:
+  silence_threshold: 500          # amplitude below this int16 peak is considered silence
+  silence_duration_seconds: 3     # stop after this many seconds of continuous silence
+  max_record_seconds: 120         # hard cap on recording length
+  output_dir: "recordings"        # folder to store wav files before (maybe) deletion
+
+# Audio webhooks list (wav uploads)
+audio_webhooks:
+  - url: "https://primary.example.com/webhook/audio"    # primary
+    timeout_seconds: 10
+    file_field_name: "audio_file"
+    debug: true
+  - url: "https://fallback.example.com/webhook/audio"   # fallback
+    timeout_seconds: 30
+    file_field_name: "audio_file"
+    debug: true
+
+# Text webhooks list (manual 'q' key JSON text)
+text_webhooks:
+  - url: "https://primary.example.com/webhook/text"   # first text endpoint
+    timeout_seconds: 10
+    debug: true
+  - url: "https://fallback.example.com/webhook/text"  # fallback text endpoint
+    timeout_seconds: 10
+    debug: true
+
+audio_feedback:
+  enabled: true
+  events:
+    wake_detected: null           # optional: path to wav file; null => default beep
+    recording_stopped: null
+    webhook_success: null
+    webhook_failure: null
+
+tts:
+  rate: 250          # optional speech rate override
+  voice_name: "Microsoft Maria Desktop - Portuguese(Brazil)"  # preferred voice by name (case-insensitive)
+  voice_index: 1     # fallback legacy index if name not found
+  debug: true        # set true to log chosen voice each utterance
+
+webhook_listener:
+  host: "0.0.0.0"  # Listen on all interfaces
+  port: 5000        # Port for the Flask server
+  endpoint: "/response"  # Path for the webhook endpoint

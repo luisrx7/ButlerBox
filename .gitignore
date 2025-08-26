@@ -1,0 +1,4 @@
+/.venv
+/.vscode
+/recordings/*
+/config.yaml

@@ -1,0 +1,8 @@
+pvporcupine
+pyaudio
+soundfile 
+requests
+PyYAML
+Flask
+pyttsx3
+pywin32
