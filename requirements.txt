@@ -6,3 +6,4 @@ PyYAML
 Flask
 pyttsx3
 pywin32
+keyboard

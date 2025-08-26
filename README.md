@@ -25,8 +25,14 @@ the embedded Flask listener and will be spoken if it is non‑blank.
 - Sequential audio webhook failover (`audio_webhooks`) – stops on first 200
 - Separate text webhook list (`text_webhooks`) for manual commands
 - Background audio upload & deletion on success
-- Retry failed audio uploads (`r` key)
+- Automatic exponential retry with jitter for both audio & text webhooks (configurable)
+- Retry previously failed audio uploads (`r` key) with queue tracking
 - Inbound Flask endpoint to speak returned text (ignores blank payloads)
+- Automatic text cleanup for TTS (strips URLs, collapses noisy symbol clusters, trims repeated punctuation)
+- Configurable recording shortcuts: abort & finalize/send mid‑record (console)
+- Optional manual start recording shortcut (bypass wake word)
+- Optional system‑wide (global) abort/finalize shortcuts (requires `keyboard` module)
+- Robust audio device disconnect handling (auto-reopen & resume when device returns)
 - Simple per-utterance TTS threads (pyttsx3) (best-effort concurrency)
 - Custom or fallback beep event sounds
 
@@ -92,6 +98,21 @@ webhook_listener:
   host: 0.0.0.0
   port: 5000
   endpoint: /response  # POST {"text": "..."}
+
+# Global webhook retry policy (applies to audio & text webhooks)
+webhook_retry:
+  max_attempts: 5           # total attempts including first
+  base_delay_seconds: 1     # initial backoff
+  backoff_factor: 2         # exponential growth
+  max_delay_seconds: 20     # ceiling for delay
+  jitter: true              # +/-25% random variance
+
+# Recording control shortcuts
+shortcuts:
+  start_recording: "Ctrl+D"      # Start a recording immediately (no wake word)
+  abort_recording: "Ctrl+A"      # During recording: discard captured audio
+  finalize_recording: "Ctrl+S"   # During recording: immediately finalize & upload
+  use_global: true                # If true, also register system-wide (global) hotkeys
 ```
 
 ### Key Parameters
@@ -123,6 +144,45 @@ When the script is running:
 - `v` : Prompt for text, speak locally only (no outbound send)
 - `r` : Retry any previously failed audio uploads
 - `x` : Print exit notice (Ctrl+C actually stops program)
+
+### Recording Shortcuts (During Active Recording)
+
+While a recording is in progress (after wake word until stop condition):
+
+- Abort shortcut: Immediately stops & discards the current recording (no file/upload).
+- Finalize shortcut: Immediately stops, saves & uploads (skips waiting for silence / max time).
+
+Console versions work only while the terminal window has focus. They support:
+1. Single character (e.g. `a`)
+2. `Ctrl+<letter>` (e.g. `Ctrl+A`)
+3. Multi‑character sequences (e.g. typing `stop`) – console only.
+
+Global versions (if `shortcuts.use_global: true`) currently support only single characters and `Ctrl+<letter>`; multi‑character sequences are ignored globally. Global presses are ignored (no output) when no recording is active.
+
+### Global Hotkeys (Optional)
+
+Set `shortcuts.use_global: true` and install the `keyboard` Python package (already listed in requirements). On Windows this may require running the terminal as Administrator. If the module or permissions are unavailable, the program gracefully falls back to console shortcuts.
+
+If `start_recording` is defined it can also be global (single key or `Ctrl+<letter>`). Pressing it begins a recording immediately (plays the wake beep) exactly as if the wake word had been detected. Ignored if a recording is already active.
+
+### Webhook Retry Policy
+
+Both audio and text webhook POSTs use the shared `webhook_retry` settings. Each individual webhook is attempted up to `max_attempts` with exponential delay: `delay = base_delay_seconds * backoff_factor^(attempt-1)`, capped by `max_delay_seconds`, then jittered (+/-25%). Audio webhooks try the next endpoint only after exhausting retries on the current one. Text webhooks stop at the first success.
+
+### Text Cleanup
+
+Inbound (and manually entered) text destined for TTS is sanitized:
+- Markdown links `[label](url)` -> `label`
+- Raw `http(s)://` and `www.` URLs removed
+- Clusters of noisy symbols (`@#$%^&*+|<>[]{}` etc.) collapsed to spaces
+- Repeated punctuation like `!!!` or `???` reduced to a single character
+- Extraneous whitespace collapsed
+
+Original text is still printed before the cleaned version is spoken.
+
+### Audio Device Resilience
+
+If the input device disappears (e.g., unplugging a headset), the program enters a silent retry loop, enumerating devices on first failure and reattempting to open until one succeeds. Recording and wake detection automatically resume once the device is back with a short stability check (ensuring real audio frames before declaring recovery).
 
 ### Inbound Text → Speech
 
@@ -172,8 +232,9 @@ Provide short `.wav` files (mono or stereo) for any event. Update the correspond
 
 - Single-threaded TTS queue for strict ordering
 - Structured logging / JSON logs
-- Automatic exponential backoff for upload failures
-- Optional VAD library integration
+- Rich status UI / tray indicator
+- Optional external VAD integration for earlier endpointing
+- Configurable device selection & hot-swap prioritization
 
 ## License
 

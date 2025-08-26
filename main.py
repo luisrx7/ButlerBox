@@ -8,6 +8,8 @@ import requests
 import pvporcupine
 import pyaudio
 import threading
+import re
+import random
 from datetime import datetime, UTC
 from flask import Flask, request, jsonify
 import pyttsx3
@@ -23,12 +25,21 @@ try:
     import winsound  # Windows-specific (user is on Windows)
 except ImportError:  # fallback noop
     winsound = None
+try:
+    import keyboard  # For global hotkeys
+except ImportError:
+    keyboard = None
 
 
 CONFIG_PATH = "config.yaml"
 
 tts_voice_id = None   # Resolved voice id (string) selected at startup
 tts_rate = None       # Configured speech rate (int)
+recording_active = False  # Global flag to pause generic keyboard handling during active recording
+shortcut_abort_requested = False   # Set by global hotkey (if enabled)
+shortcut_finalize_requested = False
+global_hotkeys_ready = False
+manual_record_request = False  # Trigger manual recording (bypass wake word)
 
 # ---------------- Failed upload tracking (for manual retry) ------------- #
 pending_failed_uploads = []
@@ -150,6 +161,34 @@ def speak_text(text):
     threading.Thread(target=_speak_blocking, args=(text,), daemon=True).start()
 
 
+def cleanup_text(original: str) -> str:
+        """Prepare text for TTS: remove URLs & noisy symbol clusters while preserving meaning.
+
+        Steps:
+            1. Strip markdown links [label](url) -> label
+            2. Remove raw http(s)/www URLs
+            3. Replace clusters of certain symbols (@ # $ % ^ & * _ + = ~ ` | < > { } [ ]) with a space
+            4. Collapse repeated punctuation like '!!!' -> '!'
+            5. Collapse whitespace
+        Sentence punctuation (.,!?;:) is preserved.
+        """
+        if not original:
+                return ''
+        text = original
+        # Markdown links
+        text = re.sub(r'\[(.*?)\]\((https?://[^)]+)\)', r'\1', text)
+        # Raw URLs
+        text = re.sub(r'https?://\S+', ' ', text)
+        text = re.sub(r'www\.\S+', ' ', text)
+        # Symbol clusters (keep normal punctuation)
+        text = re.sub(r'[\@\#\$%\^&\*_+=~`|<>\\\{\}\[\]]+', ' ', text)
+        # Reduce repeated punctuation (e.g., !!!! -> !, ??? -> ?)
+        text = re.sub(r'([!?.])\1{1,}', r'\1', text)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         print("CONFIG ERROR: config.yaml not found.")
@@ -228,6 +267,49 @@ def send_to_webhook_single(file_path, webhook_cfg, default_field_name="file"):
         return False, str(e)
 
 
+def _retry_params(cfg):
+    retry_cfg = cfg.get("webhook_retry", {}) or {}
+    max_attempts = int(retry_cfg.get("max_attempts", 1))
+    if max_attempts < 1:
+        max_attempts = 1
+    base_delay = float(retry_cfg.get("base_delay_seconds", 1.0))
+    backoff = float(retry_cfg.get("backoff_factor", 2.0))
+    max_delay = float(retry_cfg.get("max_delay_seconds", 30.0))
+    jitter = bool(retry_cfg.get("jitter", True))
+    return {
+        "max_attempts": max_attempts,
+        "base_delay": base_delay,
+        "backoff": backoff,
+        "max_delay": max_delay,
+        "jitter": jitter,
+    }
+
+
+def send_to_webhook_with_retry(file_path, webhook_cfg, cfg, default_field_name="file"):
+    params = _retry_params(cfg)
+    attempts = params["max_attempts"]
+    for attempt in range(1, attempts + 1):
+        ok, info = send_to_webhook_single(file_path, webhook_cfg, default_field_name=default_field_name)
+        if ok:
+            if attempt > 1:
+                print(f"✅ Succeeded after {attempt} attempt(s).")
+            return True
+        if attempt == attempts:
+            print(f"❌ Exhausted {attempts} attempt(s) for webhook {webhook_cfg.get('url')}")
+            return False
+        # compute delay
+        delay = params["base_delay"] * (params["backoff"] ** (attempt - 1))
+        delay = min(delay, params["max_delay"])
+        if params["jitter"]:
+            # add +/- 25% jitter
+            jitter_span = delay * 0.25
+            delay = delay + random.uniform(-jitter_span, jitter_span)
+            delay = max(0.05, delay)
+        print(f"⏳ Retry {attempt + 1}/{attempts} for {webhook_cfg.get('url')} in {delay:.2f}s (last error/status: {info})")
+        time.sleep(delay)
+    return False
+
+
 def send_to_any_webhook(file_path, cfg):
     # Audio uploads use 'audio_webhooks'
     webhooks_list = cfg.get("audio_webhooks") or []
@@ -236,11 +318,11 @@ def send_to_any_webhook(file_path, cfg):
         return False
     print(f"📡 Attempting up to {len(webhooks_list)} audio webhook(s) sequentially...")
     for idx, wh in enumerate(webhooks_list, 1):
-        success, info = send_to_webhook_single(file_path, wh)
+        success = send_to_webhook_with_retry(file_path, wh, cfg)
         if success:
             print(f"✅ Audio webhook #{idx} succeeded; stopping attempts.")
             return True
-        print(f"↪️  Audio webhook #{idx} failed ({info}); trying next...")
+        print(f"↪️  Audio webhook #{idx} failed after retries; trying next...")
     print("❌ All configured audio webhooks failed.")
     return False
 
@@ -257,18 +339,110 @@ def send_text_to_webhooks(text, cfg):
         if not url:
             print(f"#{idx} missing url; skipping")
             continue
-        try:
-            r = requests.post(url, json={"text": text}, timeout=wh.get("timeout_seconds", 10))
-            ok = (r.status_code == 200)
-            print(f"➡️  Text webhook #{idx} {url} -> {r.status_code}{' (success)' if ok else ''}")
-            any_success = any_success or ok
+        # Build a lightweight wrapper to reuse retry logic without file
+        def single_text_attempt():
+            try:
+                r = requests.post(url, json={"text": text}, timeout=wh.get("timeout_seconds", 10))
+                ok_local = (r.status_code == 200)
+                print(f"➡️  Text webhook #{idx} {url} -> {r.status_code}{' (success)' if ok_local else ''}")
+                return ok_local, r.status_code
+            except Exception as e:
+                print(f"❌ Text webhook #{idx} error: {e}")
+                return False, str(e)
+
+        # Adapt retry loop
+        params = _retry_params(cfg)
+        attempts = params["max_attempts"]
+        for attempt in range(1, attempts + 1):
+            ok, info = single_text_attempt()
             if ok:
+                any_success = True
+                if attempt > 1:
+                    print(f"✅ Text webhook succeeded after {attempt} attempt(s).")
                 break
-        except Exception as e:
-            print(f"❌ Text webhook #{idx} error: {e}")
+            if attempt == attempts:
+                print(f"❌ Text webhook #{idx} exhausted {attempts} attempt(s).")
+                break
+            delay = params["base_delay"] * (params["backoff"] ** (attempt - 1))
+            delay = min(delay, params["max_delay"])
+            if params["jitter"]:
+                jitter_span = delay * 0.25
+                delay = delay + random.uniform(-jitter_span, jitter_span)
+                delay = max(0.05, delay)
+            print(f"⏳ Retry {attempt + 1}/{attempts} for text webhook #{idx} in {delay:.2f}s (last: {info})")
+            time.sleep(delay)
+        if any_success:
+            break
     if not any_success:
         print("❌ No webhook accepted the text (all failed or non-200).")
     return any_success
+
+
+# ---------------- Global shortcut registration (optional) ------------- #
+def _set_flag(kind):
+    global shortcut_abort_requested, shortcut_finalize_requested, manual_record_request, recording_active
+    if kind == 'start':
+        # Only start if not currently recording
+        if not recording_active:
+            manual_record_request = True
+            print("🎙 Manual recording start shortcut pressed.")
+        return
+    # The remaining flags only matter during an active recording
+    if not recording_active:
+        return
+    if kind == 'abort':
+        shortcut_abort_requested = True
+        print("🧹 Global abort shortcut pressed.")
+    elif kind == 'finalize':
+        shortcut_finalize_requested = True
+        print("✋ Global finalize shortcut pressed.")
+
+
+def register_global_shortcuts(cfg):
+    sc_cfg = cfg.get("shortcuts", {}) or {}
+    if not sc_cfg.get("use_global"):
+        return
+    if keyboard is None:
+        print("⚠️ Global shortcuts requested but 'keyboard' module not available. Install with: pip install keyboard (may require admin).")
+        return
+
+    def _normalize(spec):
+        if not spec:
+            return None
+        s = str(spec).strip().lower()
+        # ctrl+<letter>
+        if s.startswith('ctrl+') and len(s) == 6 and 'a' <= s[-1] <= 'z':
+            return s.replace('+', '+')  # keep format
+        # single char
+        if len(s) == 1:
+            return s
+        # sequences (multi-char) not supported globally
+        print(f"ℹ️ Global shortcut '{spec}' ignored (multi-character sequences not supported globally).")
+        return None
+
+    start_spec = _normalize(sc_cfg.get('start_recording'))
+    abort_spec = _normalize(sc_cfg.get('abort_recording'))
+    finalize_spec = _normalize(sc_cfg.get('finalize_recording'))
+    if not any([start_spec, abort_spec, finalize_spec]):
+        print("ℹ️ No valid global shortcuts to register.")
+        return
+    try:
+        parts = []
+        if start_spec:
+            keyboard.add_hotkey(start_spec, lambda: _set_flag('start'))
+            parts.append(f"start={start_spec}")
+        if abort_spec:
+            keyboard.add_hotkey(abort_spec, lambda: _set_flag('abort'))
+            parts.append(f"abort={abort_spec}")
+        if finalize_spec:
+            keyboard.add_hotkey(finalize_spec, lambda: _set_flag('finalize'))
+            parts.append(f"finalize={finalize_spec}")
+        print("🔗 Registered global shortcuts: " + ", ".join(parts))
+        global global_hotkeys_ready
+        global_hotkeys_ready = True
+    except Exception as e:
+        print(f"⚠️ Failed to register global shortcuts: {e}")
+        return
 
 
 def record_audio_after_wake(porcupine, audio_stream, cfg):
@@ -278,6 +452,35 @@ def record_audio_after_wake(porcupine, audio_stream, cfg):
     max_record = rec_cfg.get("max_record_seconds", 120)
     output_dir = rec_cfg.get("output_dir", "recordings")
 
+    shortcuts_cfg = cfg.get("shortcuts", {}) or {}
+    raw_abort = str(shortcuts_cfg.get("abort_recording", '')).strip()
+    raw_finalize = str(shortcuts_cfg.get("finalize_recording", '')).strip()
+
+    use_global = bool(shortcuts_cfg.get("use_global"))
+
+    def _parse_shortcut(spec):
+        if not spec:
+            return None
+        spec_l = spec.lower()
+        # Ctrl+<letter>
+        if spec_l.startswith('ctrl+') and len(spec_l) == 6:
+            letter = spec_l[-1]
+            if 'a' <= letter <= 'z':
+                # Control char: Ctrl+A => 0x01 ... Ctrl+Z => 0x1A
+                ctrl_char = chr(ord(letter) - 96)
+                return {"type": "char", "value": ctrl_char, "label": f"Ctrl+{letter.upper()}"}
+        # Single character
+        if len(spec_l) == 1:
+            return {"type": "char", "value": spec_l, "label": spec}
+        # Sequence of characters (case-insensitive, no modifiers)
+        return {"type": "sequence", "value": spec_l, "label": spec}
+
+    abort_sc = _parse_shortcut(raw_abort)
+    finalize_sc = _parse_shortcut(raw_finalize)
+
+    if abort_sc and finalize_sc and abort_sc == finalize_sc:
+        print("⚠️  abort_recording and finalize_recording shortcuts are identical; abort will take precedence.")
+
     start_time = time.time()
     last_sound_time = start_time
     frames = []
@@ -286,13 +489,84 @@ def record_audio_after_wake(porcupine, audio_stream, cfg):
     sample_rate = porcupine.sample_rate
     frame_duration = frame_length / float(sample_rate)
 
-    print(f"🎙 Recording (max {max_record}s, stop after {silence_duration}s silence)...")
+    global recording_active
+    recording_active = True
+    keys_info = []
+    if abort_sc:
+        keys_info.append(f"[{abort_sc['label']}] abort")
+    if finalize_sc:
+        keys_info.append(f"[{finalize_sc['label']}] finalize/send")
+    extra = (" | ".join(keys_info)) if keys_info else ""
+    print(f"🎙 Recording (max {max_record}s, stop after {silence_duration}s silence){(' -- ' + extra) if extra else ''}...")
+
+    aborted = False
+    # Sequence buffer: list of (char, timestamp)
+    seq_buffer = []
+    seq_window = 1.0  # seconds to keep recent keystrokes for sequence matching
+
+    # Reset global shortcut flags at start
+    global shortcut_abort_requested, shortcut_finalize_requested
+    shortcut_abort_requested = False
+    shortcut_finalize_requested = False
 
     while True:
         pcm = audio_stream.read(frame_length, exception_on_overflow=False)
         frames.append(pcm)
         if not amplitude_is_silence(pcm, silence_threshold):
             last_sound_time = time.time()
+
+        # Global shortcut checks (if enabled)
+        if use_global:
+            if abort_sc and shortcut_abort_requested:
+                aborted = True
+                reason = "🧹 Aborted by global shortcut"
+                shortcut_abort_requested = False
+                break
+            if finalize_sc and shortcut_finalize_requested:
+                reason = "✋ Manual finalize (global)"
+                shortcut_finalize_requested = False
+                break
+
+        # Check shortcut keys (Windows console)
+        if msvcrt and (abort_sc or finalize_sc) and msvcrt.kbhit():
+            # Drain all available characters this tick
+            while msvcrt.kbhit():
+                try:
+                    ch_raw = msvcrt.getwch()
+                except Exception:
+                    break
+                if not ch_raw:
+                    continue
+                ch = ch_raw
+                # Normalize: for printable we lower; leave control chars
+                if ord(ch) >= 32:
+                    ch = ch.lower()
+                now = time.time()
+                seq_buffer.append((ch, now))
+                # Trim old
+                seq_buffer = [(c, t) for (c, t) in seq_buffer if now - t <= seq_window]
+
+                def _match(sc):
+                    if not sc:
+                        return False
+                    if sc['type'] == 'char':
+                        return ch == sc['value']
+                    if sc['type'] == 'sequence':
+                        s = ''.join(c for c, _ in seq_buffer)
+                        return s.endswith(sc['value'])
+                    return False
+
+                if abort_sc and _match(abort_sc):
+                    aborted = True
+                    reason = "🧹 Aborted by user"
+                    seq_buffer.clear()
+                    break
+                if not aborted and finalize_sc and _match(finalize_sc):
+                    reason = "✋ Manual finalize"
+                    seq_buffer.clear()
+                    break
+            if aborted or reason.startswith("✋"):
+                break
 
         elapsed = time.time() - start_time
         silence_elapsed = time.time() - last_sound_time
@@ -306,6 +580,11 @@ def record_audio_after_wake(porcupine, audio_stream, cfg):
 
     print(f"🛑 Recording stopped: {reason}")
     play_sound("recording_stopped", cfg)
+    recording_active = False
+
+    if aborted:
+        print("🚫 Recording discarded (no file saved / no upload).")
+        return None, True
 
     # If we stopped because of silence, trim the trailing silence_duration seconds
     if "Silence" in reason:
@@ -327,7 +606,7 @@ def record_audio_after_wake(porcupine, audio_stream, cfg):
     write_wave(filename, sample_rate, raw_bytes)
     size_kb = len(raw_bytes) / 1024
     print(f"💾 Saved {filename} ({size_kb:.1f} KB)")
-    return filename
+    return filename, False
 
 
 def listen_loop(cfg):
@@ -360,15 +639,40 @@ def listen_loop(cfg):
     keyword_name = os.path.splitext(os.path.basename(wake_path))[0]
     print(f"🎤 Listening for wake word '{keyword_name}' ... Press Ctrl+C to exit.")
 
+    global manual_record_request
+
     try:
         while True:
+            if manual_record_request:
+                manual_record_request = False
+                # Provide the same audible cue as a wake detection
+                play_sound("wake_detected", cfg)
+                audio_file, aborted = record_audio_after_wake(porcupine, audio_stream, cfg)
+                if not aborted and audio_file:
+                    def uploader(path):
+                        ok = send_to_any_webhook(path, cfg)
+                        if ok:
+                            play_sound("webhook_success", cfg)
+                            try:
+                                os.remove(path)
+                                print(f"🧹 Deleted local file {path}")
+                            except Exception as e:
+                                print(f"⚠️ Could not delete file: {e}")
+                        else:
+                            play_sound("webhook_failure", cfg)
+                            _record_failed_upload(path)
+                    threading.Thread(target=uploader, args=(audio_file,), daemon=True).start()
+                continue
+
             pcm = audio_stream.read(porcupine.frame_length, exception_on_overflow=False)
             pcm_unpacked = struct.unpack_from("h" * porcupine.frame_length, pcm)
             result = porcupine.process(pcm_unpacked)
             if result >= 0:
                 print(f"🔑 Wake word '{keyword_name}' detected!")
                 play_sound("wake_detected", cfg)
-                audio_file = record_audio_after_wake(porcupine, audio_stream, cfg)
+                audio_file, aborted = record_audio_after_wake(porcupine, audio_stream, cfg)
+                if aborted or not audio_file:
+                    continue
 
                 def uploader(path):
                     ok = send_to_any_webhook(path, cfg)
@@ -399,6 +703,10 @@ def keyboard_loop(cfg):
         return
     print("⌨️  Keyboard controls: [q]=speak & send text, [v]=speak text only, [r]=retry failed uploads, [x]=exit notice")
     while True:
+        # Skip general key handling during active recording so record-time shortcuts work reliably
+        if 'recording_active' in globals() and recording_active:
+            time.sleep(0.05)
+            continue
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
             if not ch:
@@ -449,8 +757,11 @@ def start_webhook_listener(cfg):
                 text = ""
         if not text.strip():
             return jsonify({"status": "ignored", "reason": "blank text"}), 204
-        print(f"📥 Received text: {text}")
-        speak_text(text)
+        original_text = text
+        cleaned = cleanup_text(original_text)
+        print(f"📥 Received text: {original_text}")
+        if cleaned:
+            speak_text(cleaned)
         return jsonify({"status": "success", "message": "Spoken"}), 200
 
     threading.Thread(target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False), daemon=True).start()
@@ -459,6 +770,7 @@ def start_webhook_listener(cfg):
 def main():
     cfg = load_config()
     init_tts(cfg)
+    register_global_shortcuts(cfg)
     start_webhook_listener(cfg)
     if msvcrt:
         threading.Thread(target=keyboard_loop, args=(cfg,), daemon=True).start()
