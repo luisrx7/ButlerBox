@@ -15,6 +15,10 @@ from typing import Optional
 from datetime import datetime, UTC
 from flask import Flask, request, jsonify
 import pyttsx3
+try:
+    import comtypes, comtypes.client  # type: ignore
+except ImportError:
+    comtypes = None  # type: ignore
 import logging
 from logging.handlers import RotatingFileHandler
 try:
@@ -344,6 +348,8 @@ shortcut_abort_requested = False   # Set by global hotkey (if enabled)
 shortcut_finalize_requested = False
 global_hotkeys_ready = False
 manual_record_request = False  # Trigger manual recording (bypass wake word)
+tts_enabled = True
+_speechlib_repair_attempted = False
 
 # ---------------- Failed upload tracking (for manual retry) ------------- #
 pending_failed_uploads = []
@@ -391,39 +397,46 @@ def retry_failed_uploads(cfg):
         log("🎉 All previously failed uploads succeeded or were cleared.")
 
 def init_tts(cfg):
-    """Resolve desired voice/rate from config. Each speak spawns a fresh engine thread.
-    Adds timeout + config disable to avoid startup hang if pyttsx3 blocks.
+    """Resolve desired voice/rate from config. Perform one engine discovery.
+    Keep fast & simple; per-utterance threads will re-init their own engine.
     """
-    global tts_voice_id, tts_rate
+    global tts_voice_id, tts_rate, tts_enabled
     tts_cfg = cfg.get('tts', {}) or {}
     if tts_cfg.get('enabled', True) is False:
+        tts_enabled = False
         log("TTS disabled via config.")
         return
+    tts_enabled = True
     desired_rate = tts_cfg.get('rate')
     voice_index = tts_cfg.get('voice_index')
     voice_name = tts_cfg.get('voice_name')
     log("TTS init starting...")
     temp_engine = None
 
-    # Initialize engine in a helper thread with timeout to prevent indefinite hang.
-    init_result = {}
-    def _engine_init():
+    # Optionally pre-generate SpeechLib once
+    if comtypes is not None:
         try:
-            init_result['engine'] = pyttsx3.init()
+            dll_candidates = [
+                r"C:\\Windows\\System32\\Speech\\Common\\sapi.dll",
+                r"C:\\Windows\\SysWOW64\\Speech\\Common\\sapi.dll",
+            ]
+            for dll in dll_candidates:
+                if os.path.isfile(dll):
+                    try:
+                        comtypes.client.GetModule(dll)
+                        break
+                    except Exception:
+                        continue
         except Exception as e:
-            init_result['error'] = e
+            log(f"TTS notice (prep) ignored: {e}")
 
-    th = threading.Thread(target=_engine_init, daemon=True)
-    th.start()
-    th.join(timeout=3.0)
-    if th.is_alive():
-        log("⚠️  TTS init timed out (>3s). Continuing without voice discovery.")
-        return
-    if 'error' in init_result:
-        log(f"TTS init (engine create) failed: {init_result['error']}")
+    # Direct (simple) engine create; short timeout not needed here
+    try:
+        temp_engine = pyttsx3.init(driverName='sapi5')
+    except Exception as e:
+        log(f"TTS init (engine create) failed: {e}")
         return
 
-    temp_engine = init_result.get('engine')
     try:
         voices = (temp_engine.getProperty('voices') or []) if temp_engine else []
         chosen = None
@@ -452,19 +465,58 @@ def init_tts(cfg):
                 temp_engine.stop()
             except Exception:
                 pass
+    # Nothing else; per-call threads will apply voice/rate
+
+def _repair_speechlib_once():
+    global _speechlib_repair_attempted
+    if _speechlib_repair_attempted or comtypes is None:
+        return
+    _speechlib_repair_attempted = True
+    try:
+        import comtypes.gen as gen  # type: ignore
+        gen_dir = os.path.dirname(getattr(gen, '__file__', '') or '')
+        if gen_dir and os.path.isdir(gen_dir):
+            for fn in os.listdir(gen_dir):
+                if fn.startswith('SpeechLib'):
+                    try:
+                        os.remove(os.path.join(gen_dir, fn))
+                    except Exception:
+                        pass
+        dll_candidates = [
+            r"C:\\Windows\\System32\\Speech\\Common\\sapi.dll",
+            r"C:\\Windows\\SysWOW64\\Speech\\Common\\sapi.dll",
+        ]
+        for dll in dll_candidates:
+            if os.path.isfile(dll):
+                try:
+                    comtypes.client.GetModule(dll)
+                    break
+                except Exception:
+                    continue
+        log("TTS repair: SpeechLib regenerated")
+    except Exception as e:
+        log(f"TTS repair skipped: {e}")
+
 
 def speak_text(text):
-    if not text:
+    if not text or not tts_enabled:
         return
-
-    def _speak_blocking(msg):
+    def _speak(msg):
         if pythoncom:
             try:
                 pythoncom.CoInitialize()
             except Exception:
                 pass
+        engine = None
         try:
-            engine = pyttsx3.init()
+            try:
+                engine = pyttsx3.init(driverName='sapi5')
+            except Exception as e:
+                if 'ISpeechVoice' in str(e):
+                    _repair_speechlib_once()
+                    engine = pyttsx3.init(driverName='sapi5')
+                else:
+                    raise
             if tts_rate is not None:
                 try: engine.setProperty('rate', tts_rate)
                 except Exception: pass
@@ -475,16 +527,29 @@ def speak_text(text):
             engine.runAndWait()
         except Exception as e:
             log(f"TTS error: {e}")
+            # Fallback try PowerShell
+            try:
+                escaped = msg.replace('`','``').replace('"','\"')
+                ps_cmd = (
+                    f'powershell -NoProfile -Command "Add-Type -AssemblyName System.Speech; '
+                    f'$sp=New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                    f'$sp.Rate={(tts_rate if tts_rate else 0)}; $sp.Speak(\"{escaped}\");"'
+                )
+                os.system(ps_cmd)
+            except Exception:
+                pass
         finally:
             try:
-                engine.stop()
+                if engine:
+                    engine.stop()
             except Exception:
                 pass
             if pythoncom:
-                try: pythoncom.CoUninitialize()
-                except Exception: pass
-
-    threading.Thread(target=_speak_blocking, args=(text,), daemon=True).start()
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+    threading.Thread(target=_speak, args=(text,), daemon=True).start()
 
 
 def cleanup_text(original: str) -> str:
