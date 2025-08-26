@@ -49,6 +49,7 @@ log_lock = threading.Lock()
 log_buffer = []  # store log lines
 LOG_LIMIT = 800
 ui_stop_event = threading.Event()
+# Removed log scrolling state (always tail newest logs)
 
 # Command input (non-blocking) state
 command_mode = None  # None | 'send_text' | 'speak_only'
@@ -69,6 +70,22 @@ status = {
     'device_recoveries': 0,
     'last_device_error': None,
     'input_device': None,
+    'output_device': None,
+    'ui_tick': 0,
+}
+
+# Runtime flags for device management
+mic_reset_request = False
+speaker_reset_request = False
+cycle_input_device_request = False
+cycle_output_device_request = False
+selected_input_device_index = None
+selected_output_device_index = None
+
+# Scroll state for bouncing marquee
+scroll_state = {
+    'input': {'pos': 0, 'dir': 1},
+    'output': {'pos': 0, 'dir': 1},
 }
 
 import builtins as _b
@@ -102,13 +119,20 @@ def _build_layout(cfg):
         Layout(name='left', ratio=3),
         Layout(name='right', ratio=2)
     )
+    # Give shortcuts more vertical space (so 3 lines always visible)
     layout['left'].split_column(
         Layout(name='shell', ratio=2),
-        Layout(name='shortcuts', ratio=1)
+        Layout(name='shortcuts', ratio=2)
     )
-    # Logs
+    # Logs (always show tail)
+    max_lines = 400
     with log_lock:
-        logs_text = "\n".join(log_buffer[-400:]) if log_buffer else "(no logs yet)"
+        total = len(log_buffer)
+        if total == 0:
+            logs_text = "(no logs yet)"
+        else:
+            start = max(0, total - max_lines)
+            logs_text = "\n".join(log_buffer[start:total])
     layout['logs'].update(Panel(logs_text, title='Logs', border_style='cyan', box=box.ROUNDED))
     # Shell / current input
     with command_lock:
@@ -129,20 +153,23 @@ def _build_layout(cfg):
     entries.append("<v> playback tts")
     entries.append("<r> retry failed")
     entries.append("<x> exit")
+    entries.append("<m> reset mic+spk")
+    entries.append("<Alt+I|i> next input dev")
+    entries.append("<Alt+O|o> next output dev")
     # Recording shortcuts
     if sc_cfg.get('start_recording'): entries.append(f"<{sc_cfg.get('start_recording')}> start")
     if sc_cfg.get('abort_recording'): entries.append(f"<{sc_cfg.get('abort_recording')}> abort")
     if sc_cfg.get('finalize_recording'): entries.append(f"<{sc_cfg.get('finalize_recording')}> send")
     entries.append(f"[global] {'on' if sc_cfg.get('use_global') else 'off'}")
-    # Compress into two lines
-    if len(entries) <= 4:
-        line1 = '  '.join(entries)
-        line2 = ''
+    # Compress into three lines for readability
+    if entries:
+        per_line = (len(entries) + 2) // 3
+        line1 = '  '.join(entries[:per_line])
+        line2 = '  '.join(entries[per_line:per_line*2])
+        line3 = '  '.join(entries[per_line*2:])
+        shortcuts_text = '\n'.join([l for l in [line1, line2, line3] if l])
     else:
-        half = (len(entries) + 1) // 2
-        line1 = '  '.join(entries[:half])
-        line2 = '  '.join(entries[half:])
-    shortcuts_text = (line1 + ('\n' + line2 if line2 else ''))
+        shortcuts_text = ''
     layout['shortcuts'].update(Panel(shortcuts_text, title='Shortcuts', border_style='green', box=box.ROUNDED))
     # Right (status panel)
     with status_lock:
@@ -152,20 +179,57 @@ def _build_layout(cfg):
         rec_reason = status['recording_reason']
         aw = status['last_audio_webhook']
         tw = status['last_text_webhook']
+        input_full = status.get('input_device', '?') or '?'
+        output_full = status.get('output_device', '?') or '?'
+    # Estimate available width for device name text inside status panel.
+    try:
+        total_w = console.size.width if console else 80
+    except Exception:
+        total_w = 80
+    right_panel_w = max(20, int(total_w * 2 / 5) - 4)
+    input_label_prefix = len("Input dev: ")
+    output_label_prefix = len("Output dev: ")
+    input_name_w = max(8, right_panel_w - input_label_prefix)
+    output_name_w = max(8, right_panel_w - output_label_prefix)
+    def _bounce(name, width, key):
+        if width <= 0:
+            return ''
+        if len(name) <= width:
+            # Reset scroll state so it starts from beginning if it later grows
+            with status_lock:
+                scroll_state[key]['pos'] = 0
+                scroll_state[key]['dir'] = 1
+            return name
+        with status_lock:
+            pos = scroll_state[key]['pos']
+            direction = scroll_state[key]['dir']
+            max_offset = len(name) - width
+            pos += direction
+            if pos >= max_offset:
+                pos = max_offset
+                direction = -1
+            elif pos <= 0:
+                pos = 0
+                direction = 1
+            scroll_state[key]['pos'] = pos
+            scroll_state[key]['dir'] = direction
+        segment = name[pos:pos+width]
+        return segment.ljust(width)
     def _fmt(res):
         if not res:
             return '-'
         return f"{res.get('time','?')} {'OK' if res.get('success') else 'FAIL'} {res.get('code','')}"
     status_lines = [
-        f"State: {rec_state}",
-        f"Last wake: {last_wake}",
-        f"Failed uploads: {f_uploads}",
-        f"Last audio WH: {_fmt(aw)}",
-        f"Last text WH: {_fmt(tw)}",
-        f"Dev errs: {status.get('device_errors',0)} | Recov: {status.get('device_recoveries',0)}",
-        f"Last dev err: {status.get('last_device_error','-') or '-'}",
-        f"Input dev: {status.get('input_device','?')}",
-        (f"Reason: {rec_reason}" if rec_reason else ''),
+        f"State: {rec_state}",           # 1. Status
+        f"Last wake: {last_wake}",       # 2. Last wake
+        f"Input dev: {_bounce(input_full, input_name_w, 'input')}",   # 3. Input dev
+        f"Output dev: {_bounce(output_full, output_name_w, 'output')}",# 4. Output dev
+        f"Last audio WH: {_fmt(aw)}",    # 5. Last audio WH
+        f"Last text WH: {_fmt(tw)}",     # 6. Last text WH
+        f"Dev errs: {status.get('device_errors',0)} | Recov: {status.get('device_recoveries',0)}", # 7. device stats
+        f"Failed uploads: {f_uploads}",  # (extra)
+        f"Last dev err: {status.get('last_device_error','-') or '-'}", # (extra)
+        (f"Reason: {rec_reason}" if rec_reason else ''),              # (extra)
     ]
     status_lines = [l for l in status_lines if l]
     layout['right'].update(Panel('\n'.join(status_lines), title='Status', border_style='blue', box=box.ROUNDED))
@@ -177,6 +241,8 @@ def ui_loop(cfg):
     try:
         with Live(console=console, refresh_per_second=12, screen=True) as live:
             while not ui_stop_event.is_set():
+                with status_lock:
+                    status['ui_tick'] += 1
                 layout = _build_layout(cfg)
                 live.update(layout)
                 time.sleep(0.15)
@@ -812,29 +878,114 @@ def listen_loop(cfg):
 
     porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[wake_path], model_path=model_path)
     pa = pyaudio.PyAudio()
+    global selected_input_device_index, selected_output_device_index
     # Try to capture selected input device index/name for status
     try:
         default_index = pa.get_default_input_device_info().get('index')
         dev_info = pa.get_device_info_by_index(default_index)
         with status_lock:
             status['input_device'] = dev_info.get('name')
+        selected_input_device_index = default_index
     except Exception:
         with status_lock:
             status['input_device'] = 'Unknown'
-    audio_stream = pa.open(
-        rate=porcupine.sample_rate,
-        channels=1,
-        format=pyaudio.paInt16,
-        input=True,
-        frames_per_buffer=porcupine.frame_length,
-    )
+    # Attempt to capture a default output device name (best-effort)
+    try:
+        out_default = pa.get_default_output_device_info().get('index')
+        out_info = pa.get_device_info_by_index(out_default)
+        with status_lock:
+            status['output_device'] = out_info.get('name')
+        selected_output_device_index = out_default
+    except Exception:
+        pass
+    def _open_input(idx):
+        return pa.open(
+            rate=porcupine.sample_rate,
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            input_device_index=idx if idx is not None else None,
+            frames_per_buffer=porcupine.frame_length,
+        )
+    audio_stream = _open_input(selected_input_device_index)
     keyword_name = os.path.splitext(os.path.basename(wake_path))[0]
     log(f"🎤 Listening for wake word '{keyword_name}' ... Press Ctrl+C to exit.")
 
     global manual_record_request
 
     try:
+        global mic_reset_request, speaker_reset_request, cycle_input_device_request, cycle_output_device_request
         while True:
+            # Handle pending device actions
+            if mic_reset_request:
+                mic_reset_request = False
+                try:
+                    audio_stream.close()
+                except Exception:
+                    pass
+                try:
+                    audio_stream = _open_input(selected_input_device_index)
+                    with status_lock:
+                        status['device_recoveries'] += 1
+                    log("🔄 Mic reset complete")
+                except Exception as e:
+                    with status_lock:
+                        status['device_errors'] += 1
+                    log(f"❌ Mic reset failed: {e}")
+            if cycle_input_device_request:
+                cycle_input_device_request = False
+                try:
+                    device_count = pa.get_device_count()
+                    input_indices = []
+                    for i in range(device_count):
+                        info = pa.get_device_info_by_index(i)
+                        if info.get('maxInputChannels', 0) > 0:
+                            input_indices.append(i)
+                    if input_indices:
+                        if selected_input_device_index in input_indices:
+                            pos = input_indices.index(selected_input_device_index)
+                            selected_input_device_index = input_indices[(pos + 1) % len(input_indices)]
+                        else:
+                            selected_input_device_index = input_indices[0]
+                        try:
+                            audio_stream.close()
+                        except Exception:
+                            pass
+                        audio_stream = _open_input(selected_input_device_index)
+                        info = pa.get_device_info_by_index(selected_input_device_index)
+                        with status_lock:
+                            status['input_device'] = info.get('name')
+                        log(f"➡️  Switched input device to {info.get('name')}")
+                except Exception as e:
+                    log(f"⚠️ Could not cycle input device: {e}")
+            if cycle_output_device_request:
+                cycle_output_device_request = False
+                try:
+                    device_count = pa.get_device_count()
+                    output_indices = []
+                    for i in range(device_count):
+                        info = pa.get_device_info_by_index(i)
+                        if info.get('maxOutputChannels', 0) > 0:
+                            output_indices.append(i)
+                    if output_indices:
+                        if selected_output_device_index in output_indices:
+                            pos = output_indices.index(selected_output_device_index)
+                            selected_output_device_index = output_indices[(pos + 1) % len(output_indices)]
+                        else:
+                            selected_output_device_index = output_indices[0]
+                        info = pa.get_device_info_by_index(selected_output_device_index)
+                        with status_lock:
+                            status['output_device'] = info.get('name')
+                        log(f"➡️  Selected output device {info.get('name')} (note: TTS library may ignore)")
+                except Exception as e:
+                    log(f"⚠️ Could not cycle output device: {e}")
+            if speaker_reset_request:
+                speaker_reset_request = False
+                try:
+                    init_tts(cfg)
+                    log("🔁 Speaker (TTS) reset")
+                except Exception as e:
+                    log(f"❌ Speaker reset failed: {e}")
             if manual_record_request:
                 manual_record_request = False
                 # Provide the same audible cue as a wake detection
@@ -931,10 +1082,30 @@ def keyboard_loop(cfg):
         log("Keyboard interaction not available on this platform.")
         return
     log("⌨️  Keyboard controls active (non-blocking mode). 'q'=compose send+tts, 'v'=compose tts-only, Enter=commit, Esc=cancel, r=retry uploads, x=exit notice")
-    global command_mode, command_buffer
+    global command_mode, command_buffer, mic_reset_request, speaker_reset_request, cycle_input_device_request, cycle_output_device_request
+    # Alt key detection (msvcrt): an initial '\x00' or '\xe0' followed by scan code.
+    # We'll map scan codes for I and O (23, 24) to cycle requests.
     while True:
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
+            alt_scan = None
+            if ch in ('\x00', '\xe0') and msvcrt.kbhit():
+                scan = msvcrt.getwch()
+                try:
+                    alt_scan = ord(scan)
+                except Exception:
+                    alt_scan = None
+                # Map scan codes (typical): I=23, O=24 (may vary by layout)
+                if alt_scan == 23:  # Alt+I
+                    cycle_input_device_request = True
+                    log("Cycle input device requested (Alt+I)")
+                    continue
+                if alt_scan == 24:  # Alt+O
+                    cycle_output_device_request = True
+                    log("Cycle output device requested (Alt+O)")
+                    continue
+                else:
+                    log(f"(Alt scan {alt_scan} ignored; unknown)")
             if ch == '\r':  # Enter
                 with command_lock:
                     mode = command_mode
@@ -972,6 +1143,18 @@ def keyboard_loop(cfg):
                             command_buffer = []
                         elif lower == 'r':
                             threading.Thread(target=retry_failed_uploads, args=(cfg,), daemon=True).start()
+                        # Removed manual log scrolling shortcuts
+                        elif lower == 'm':
+                            mic_reset_request = True
+                            speaker_reset_request = True
+                            log("Mic + Speaker reset requested")
+                        elif lower == 'i':
+                            cycle_input_device_request = True
+                            log("Cycle input device requested (i)")
+                        elif lower == 'o':
+                            cycle_output_device_request = True
+                            log("Cycle output device requested (o)")
+                        # Removed plain i/p cycling; now Alt+I / Alt+O
                         elif lower == 'x':
                             log("Exiting requested by user (x key). Press Ctrl+C to stop main loop.")
             # else ignore other scan codes (function keys etc.)
