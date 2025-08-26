@@ -156,15 +156,37 @@ def _build_layout(cfg):
     layout['shell'].update(Panel(shell_line, title='Shell', border_style='magenta', box=box.ROUNDED))
     # Shortcuts panel
     sc_cfg = cfg.get('shortcuts', {}) or {}
+    # Default single-key (non-global) shortcuts (user may override in config under shortcuts: ...)
+    default_user_keys = {
+        'send_text_key': 'q',
+        'tts_only_key': 'v',
+        'retry_failed_key': 'r',
+        'exit_key': 'x',
+        'reset_io_key': 'm',
+        'cycle_input_key': 'i',
+        'cycle_output_key': 'o',
+    }
+    user_keys = {}
+    warnings_local = []
+    for k, dv in default_user_keys.items():
+        raw = sc_cfg.get(k, dv)
+        if not isinstance(raw, str) or len(raw.strip()) != 1:
+            user_keys[k] = dv
+            if k in sc_cfg:
+                warnings_local.append(f"shortcut {k} invalid -> using default '{dv}'")
+        else:
+            user_keys[k] = raw.strip().lower()
+    if warnings_local:
+        for w in warnings_local:
+            log(f"⚠️ {w}")
     entries = []
-    # General commands
-    entries.append("<q> ✉️ send")
-    entries.append("<v> 🔊 tts")
-    entries.append("<r> 🔁 retry")
-    entries.append("<x> ❌ exit")
-    entries.append("<m> ♻️ reset I/O")
-    entries.append("<i/Alt+I> 🎤 next in")
-    entries.append("<o/Alt+O> 🔈 next out")
+    entries.append(f"<{user_keys['send_text_key']}> ✉️ send")
+    entries.append(f"<{user_keys['tts_only_key']}> 🔊 tts")
+    entries.append(f"<{user_keys['retry_failed_key']}> 🔁 retry")
+    entries.append(f"<{user_keys['exit_key']}> ❌ exit")
+    entries.append(f"<{user_keys['reset_io_key']}> ♻️ reset I/O")
+    entries.append(f"<{user_keys['cycle_input_key']}/Alt+I> 🎤 next in")
+    entries.append(f"<{user_keys['cycle_output_key']}/Alt+O> 🔈 next out")
     # Recording shortcuts
     if sc_cfg.get('start_recording'): entries.append(f"<{sc_cfg.get('start_recording')}> start")
     if sc_cfg.get('abort_recording'): entries.append(f"<{sc_cfg.get('abort_recording')}> abort")
@@ -1094,6 +1116,29 @@ def keyboard_loop(cfg):
     global command_mode, command_buffer, mic_reset_request, speaker_reset_request, cycle_input_device_request, cycle_output_device_request
     # Alt key detection (msvcrt): an initial '\x00' or '\xe0' followed by scan code.
     # We'll map scan codes for I and O (23, 24) to cycle requests.
+    # Load re-mappable keys from config
+    sc_cfg = cfg.get('shortcuts', {}) or {}
+    key_map_defaults = {
+        'send_text_key': 'q',
+        'tts_only_key': 'v',
+        'retry_failed_key': 'r',
+        'exit_key': 'x',
+        'reset_io_key': 'm',
+        'cycle_input_key': 'i',
+        'cycle_output_key': 'o',
+    }
+    key_action = {}
+    for name, default in key_map_defaults.items():
+        val = sc_cfg.get(name, default)
+        if isinstance(val, str) and len(val.strip()) == 1:
+            key_action[name] = val.strip().lower()
+        else:
+            key_action[name] = default
+    # Reverse mapping: char -> action label
+    reverse = {}
+    for act, ch in key_action.items():
+        # last one wins if conflicts; we could warn
+        reverse[ch] = act
     while True:
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
@@ -1143,28 +1188,27 @@ def keyboard_loop(cfg):
                         elif 32 <= ord(ch) < 127:
                             command_buffer.append(ch)
                     else:
-                        if lower == 'q':
+                        action = reverse.get(lower)
+                        if action == 'send_text_key':
                             command_mode = 'send_text'
                             command_buffer = []
-                        elif lower == 'v':
+                        elif action == 'tts_only_key':
                             command_mode = 'speak_only'
                             command_buffer = []
-                        elif lower == 'r':
+                        elif action == 'retry_failed_key':
                             threading.Thread(target=retry_failed_uploads, args=(cfg,), daemon=True).start()
-                        # Removed manual log scrolling shortcuts
-                        elif lower == 'm':
+                        elif action == 'reset_io_key':
                             mic_reset_request = True
                             speaker_reset_request = True
                             log("Mic + Speaker reset requested")
-                        elif lower == 'i':
+                        elif action == 'cycle_input_key':
                             cycle_input_device_request = True
-                            log("Cycle input device requested (i)")
-                        elif lower == 'o':
+                            log("Cycle input device requested")
+                        elif action == 'cycle_output_key':
                             cycle_output_device_request = True
-                            log("Cycle output device requested (o)")
-                        # Removed plain i/p cycling; now Alt+I / Alt+O
-                        elif lower == 'x':
-                            log("Exiting requested by user (x key). Press Ctrl+C to stop main loop.")
+                            log("Cycle output device requested")
+                        elif action == 'exit_key':
+                            log("Exiting requested by user (exit key). Press Ctrl+C to stop main loop.")
             # else ignore other scan codes (function keys etc.)
         time.sleep(0.05)
 
