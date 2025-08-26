@@ -1,21 +1,328 @@
-# Wake Word Recorder & Uploader
+<div align="center">
 
-Continuously listens for a custom Porcupine wake word (e.g. "Alfredo"). After
-the wake word is detected it records microphone audio until either:
+# ButlerBox
 
-1. Continuous silence lasts a configured number of seconds, OR
-2. A configured maximum recording length is reached.
+### The wake‑word butler that lives on your box, hears you locally, and reaches outside to orchestrate web automations.
 
-The captured audio is written to a WAV file and uploaded (multipart/form-data)
-to the first successful endpoint in the `audio_webhooks` list. If an upload
-returns HTTP 200 the local file is deleted; otherwise it is retained and can be
-retried (key `r`). Distinct audio cues (beeps or user-provided WAV files)
-indicate wake detection, recording stop, upload success, and upload failure.
+Offline wake phrase detection → smart recording → resilient uploads → bidirectional text ↔ speech. A Rich terminal UI, rotating file logs, and live metrics make it a tidy self‑hosted concierge for workflows (home automation, n8n / Node-RED pipelines, personal AI agents, etc.).
 
-You can also manually enter text (`q`) which is spoken locally and POSTed as
-JSON `{"text": "..."}` to the first responding `text_webhooks` endpoint.
-Inbound processed text (e.g. from an external NLP pipeline) can be sent back to
-the embedded Flask listener and will be spoken if it is non‑blank.
+<br/>
+<i>“Hey Alfredo...” and your local box becomes a gateway.</i>
+<br/>
+
+<!-- Badges (customize once public) -->
+![Status](https://img.shields.io/badge/status-alpha-orange)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![License](https://img.shields.io/badge/license-Custom-lightgrey)
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- 🔊 **Offline wake word** via Picovoice Porcupine (low latency, no cloud round trip)
+- 🗣️ **Adaptive recording**: silence end detection + max duration safety cap
+- 📤 **Robust uploads**: sequential webhook failover + exponential backoff + jitter
+- 🔁 **Retry queue** for failed audio (press mapped retry key)
+- 📨 **Manual text → TTS & webhook** (send + speak or speak‑only modes)
+- 📥 **Inbound `/response` endpoint** to speak remote text (e.g. LLM or automation output)
+- 🧹 **Text normalization** (URL strip, noise symbol collapse, repeated punctuation squeeze)
+- 🎚️ **Device cycling & recovery** (hot‑swap resilient; restart mic and speaker on demand)
+- 🖥️ **Rich TUI** with panels: Logs / Shell / Shortcuts / Status (bouncing marquee for long device names)
+- 🧪 **Health self‑test** + optional waitress fallback if Flask dev server fails
+- 📊 **Live metrics**: received / spoken / ignored messages, listener health, endpoint & local IP
+- 🗃️ **Rotating file logging** (persistent history + in‑memory tail)
+- 🛠️ **Configurable local & global shortcuts** (with remapping in `config.yaml`)
+- 🧩 **Pluggable sound cues** (custom WAV per event or fallback beeps)
+- 🔐 **Local‑first** (no cloud audio handling unless you choose endpoints)
+
+---
+
+## 🚀 Quick Start
+
+1. Clone & enter the project:
+```powershell
+git clone https://github.com/your-org/ButlerBox.git
+cd ButlerBox
+```
+2. Create & activate a virtual environment (recommended):
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+3. Install dependencies:
+```powershell
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+4. Obtain a Picovoice Access Key + wake word `.ppn` + model (e.g. `porcupine_params_pt.pv`): https://console.picovoice.ai/
+5. Edit `config.yaml` (add your `access_key`, wakeword/model paths, webhook endpoints).
+6. Run:
+```powershell
+python .\main.py
+```
+7. Say your wake word; speak; watch panels update. Send test inbound:
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:5000/response -Method Post -Body (@{text='Olá Butler'} | ConvertTo-Json) -ContentType 'application/json'
+```
+
+---
+
+## 🧱 Architecture Overview
+
+```
+ ┌──────────┐   Wake word    ┌──────────────┐   WAV + retry   ┌──────────────┐
+ │ Microphone├──────────────▶│ Porcupine     │───────────────▶│ Audio Webhooks│ (primary, fallback...)
+ └─────┬────┘                └──────┬───────┘                 └────┬─────────┘
+       │ 16‑bit frames               │ detection event               │ 200 OK deletes file
+       ▼                             ▼                               │ failure => queue & backoff
+  ┌───────────┐   silence / max   ┌──────────────┐    manual / inbound
+  │ Recorder  │──────────────────▶│ Uploader      │◀────────┐ text JSON
+  └────┬──────┘                    └──────┬───────┘         │ (/response)
+       │ wav file                     log events            │
+       ▼                                                    │
+  ┌───────────┐   speak threads   ┌──────────────┐          │
+  │ Text Clean│──────────────────▶│ pyttsx3 (TTS)│◀─────────┘
+  └───────────┘                   └──────────────┘
+             ▲
+             │ local/manual compose (q / v)
+             │
+         ┌────────────┐
+         │ Rich UI     │ (Logs / Shell / Shortcuts / Status + metrics)
+         └────────────┘
+```
+
+---
+
+## ⚙️ Configuration Deep Dive (`config.yaml`)
+
+Key sections (abridged):
+
+```yaml
+access_key: "YOUR_PICOVOICE_ACCESS_KEY"
+wakeword_path: "Alfredo_pt_windows_v3_0_0.ppn"
+model_path: "porcupine_params_pt.pv"
+
+recording:
+  silence_threshold: 500
+  silence_duration_seconds: 3
+  max_record_seconds: 120
+  output_dir: "recordings"
+
+audio_webhooks:
+  - url: "https://primary.example.com/webhook/audio"
+    timeout_seconds: 30
+    file_field_name: "audio_file"
+    debug: true
+
+text_webhooks:
+  - url: "https://primary.example.com/webhook/text"
+    timeout_seconds: 10
+    debug: true
+
+audio_feedback:
+  enabled: true
+  events:
+    wake_detected: ./sounds/wake.wav
+    recording_stopped: ./sounds/stop.wav
+    webhook_success: ./sounds/success.wav
+    webhook_failure: ./sounds/fail.wav
+
+tts:
+  rate: 250
+  voice_name: "Microsoft Maria Desktop - Portuguese(Brazil)"
+  voice_index: 1
+  debug: true
+
+webhook_listener:
+  host: "0.0.0.0"
+  port: 5000
+  endpoint: "/response"
+  waitress_fallback: true
+  health_endpoint: "/health"   # optional override
+
+webhook_retry:
+  max_attempts: 5
+  base_delay_seconds: 1
+  backoff_factor: 2
+  max_delay_seconds: 20
+  jitter: true
+
+shortcuts:
+  start_recording: "Ctrl+R"
+  abort_recording: "Ctrl+A"
+  finalize_recording: "Ctrl+S"
+  use_global: true
+  send_text: "q"
+  tts_only: "v"
+  retry_failed: "r"
+  exit: "x"
+  reset_io: "m"
+
+logging:
+  file_enabled: true
+  file_path: "logs/app.log"
+  max_bytes: 1048576
+  backup_count: 5
+  encoding: "utf-8"
+  level: "INFO"
+```
+
+### Notable Parameters
+
+| Key | Purpose | Tune Tips |
+|-----|---------|-----------|
+| `silence_threshold` | Peak int16 amplitude considered silence | Raise if background noise causes early stops |
+| `silence_duration_seconds` | Silence window to finalize | Increase for slower speech patterns |
+| `max_record_seconds` | Hard upper cap on any clip | Prevents runaway recording |
+| `webhook_retry.*` | Exponential backoff/jitter policy | Lower delays for faster failover |
+| `waitress_fallback` | More robust production server fallback | Keep `true` outside dev |
+| `logging.file_*` | Persistent rotating logs | Set `DEBUG` temporarily for diagnosis |
+
+---
+
+## 🖥️ Rich UI Panels
+
+| Panel | Content |
+|-------|---------|
+| Logs | Auto‑tail bounded buffer (in‑memory + file) |
+| Shell | Inline compose mode (send+tts or tts‑only) |
+| Shortcuts | Colorized key map (configurable) |
+| Status | Recording state, devices (bouncing names), webhook last results, metrics |
+
+### Metrics Exposed
+- `msgs_received` / `msgs_spoken` / `msgs_ignored`
+- Listener health (`starting`, `ok`, `fail`)
+- Endpoint path + resolved primary local IP
+- Device error & recovery counters
+- Failed upload count
+
+---
+
+## 🎹 Key & Shortcut Reference
+
+Local (default letters can be remapped):
+
+| Action | Default | Description |
+|--------|---------|-------------|
+| Send & Speak | `q` | Compose, send to `text_webhooks`, speak cleaned text |
+| Speak Only | `v` | Compose & speak locally (no outbound) |
+| Retry Failed Uploads | `r` | Reattempt queued audio files |
+| Reset Mic+Speaker | `m` | Reopen audio devices |
+| Exit Notice | `x` | Log exit intent (Ctrl+C to terminate) |
+| Cycle Input Device | `i` / `Alt+I` | Iterate microphones |
+| Cycle Output Device | `o` / `Alt+O` | Iterate speakers (informational for TTS) |
+
+Recording (active) shortcuts (console/global): `start_recording`, `abort_recording`, `finalize_recording` as configured.
+
+Global hotkeys require `keyboard` + elevated permissions (Windows).
+
+---
+
+## 🔊 Text Cleanup Logic
+
+Pipeline: strip markdown links → remove raw URLs → collapse noisy symbol clusters → squeeze repeated punctuation → normalize whitespace. Original text still logged before speaking.
+
+---
+
+## 📡 Webhooks & Endpoints
+
+| Type | Direction | Format | Behavior |
+|------|-----------|--------|----------|
+| Audio Upload | Outbound | `multipart/form-data` (field = `file_field_name`) | Iterate endpoints until HTTP 200 → delete local file |
+| Manual Text | Outbound | JSON `{text: "..."}` | First successful endpoint stops traversal |
+| Inbound `/response` | Inbound | JSON `{text: "..."}` | Blank/whitespace ignored (204); non‑blank is cleaned + spoken |
+| Health `/health` | Inbound | GET | Returns JSON `{status: ok}` when server alive |
+
+Backoff per endpoint uses `webhook_retry` (attempt‑scoped). Jitter ±25% reduces thundering herd.
+
+---
+
+## 🧪 Health & Fallback
+
+- On startup a loopback GET to `/health` verifies binding.
+- Failure triggers log warnings; watchdog may start waitress if enabled.
+
+---
+
+## 🗃️ Logging
+
+- In‑memory ring buffer (UI) + rotating file (`logging.*`).
+- File format: `YYYY-MM-DD HH:MM:SS LEVEL message`.
+- Switch `level: DEBUG` for temporary verbose tracing.
+
+---
+
+## 🔐 Security & Hardening
+
+| Risk | Mitigation |
+|------|------------|
+| Open listener accessible on LAN | Bind `host: 127.0.0.1` or firewall rule |
+| Unauthenticated `/response` misuse | Add reverse proxy token / shared secret header (future built‑in optional auth) |
+| Sensitive wake phrase | Use uncommon/ custom trained `.ppn` |
+| Log PII in rotating file | Set lower verbosity; consider future structured redaction |
+| DOS via rapid inbound text | Potential queueing / throttling (roadmap) |
+
+---
+
+## 🛣️ Roadmap (Planned / Ideas)
+
+- Auth token & HMAC for `/response`
+- TTS queue (ordered, no overlap)
+- Colorized health (green/red) & rate metrics (msg/sec)
+- Structured JSON logging option
+- Device preference persistence (remember last chosen index)
+- Plugin hooks (pre/post upload / pre speech)
+- Cross‑platform packaging (PyInstaller)
+- Alternative TTS backends (Edge / ElevenLabs) via strategy layer
+
+Contributions & feature requests welcome via Issues/PRs once repo is public.
+
+---
+
+## ❓ FAQ
+
+**Why Porcupine?**  Low CPU, offline, reliable wake phrase detection.
+
+**Will this stream speech to cloud?**  Only if you configure outbound webhook endpoints that themselves do so. Core wake + TTS remain local.
+
+**Can I run it headless?**  Yes. Rich UI is optional; logs still persist to file.
+
+**Why are some shortcuts not remappable (Alt+I/O)?**  They rely on scan patterns for device cycling; kept fixed to avoid conflicts.
+
+**Does output device cycling change TTS device?**  Currently informational (pyttsx3 driver constraints). Roadmap includes improved routing.
+
+**How big can logs get?**  Single file capped by `max_bytes` then rotated (N backups). In‑memory log limited by `LOG_LIMIT` (configurable in code).
+
+---
+
+## 🤝 Contributing
+
+Open an issue describing feature / bug. Provide logs (set `logging.level: DEBUG`) and steps. PR guidelines (proposed):
+- Keep patches focused; update README where behavior changes
+- Add config keys with defaults; avoid breaking existing YAML
+- Prefer small, testable helpers to large multi‑purpose functions
+
+Linting/tests (future) will be documented once added.
+
+---
+
+## 📜 License
+
+Internal / Personal Project (define explicit license before public release). Ensure compliance with Picovoice SDK terms for wake word files & access keys.
+
+---
+
+## 🙌 Acknowledgements
+
+- Picovoice Porcupine for offline wake word detection
+- Text normalization ideas inspired by common TTS hygiene practices
+- Rich library for ergonomic terminal UI
+
+---
+
+Happy automating — Your box just got a butler.
 
 ## Features
 

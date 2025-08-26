@@ -75,6 +75,13 @@ status = {
     'input_device': None,
     'output_device': None,
     'ui_tick': 0,
+    # Metrics / listener
+    'msgs_received': 0,
+    'msgs_spoken': 0,
+    'msgs_ignored': 0,
+    'listener_health': 'starting',  # starting | ok | fail
+    'endpoint_path': None,
+    'host_ip': None,
 }
 
 # Runtime flags for device management
@@ -244,6 +251,12 @@ def _build_layout(cfg):
         tw = status['last_text_webhook']
         input_full = status.get('input_device', '?') or '?'
         output_full = status.get('output_device', '?') or '?'
+        msgs_received = status.get('msgs_received', 0)
+        msgs_spoken = status.get('msgs_spoken', 0)
+        msgs_ignored = status.get('msgs_ignored', 0)
+        listener_health = status.get('listener_health', '-')
+        endpoint_path = status.get('endpoint_path', '-')
+        host_ip = status.get('host_ip', '-')
     # Estimate available width for device name text inside status panel.
     try:
         total_w = console.size.width if console else 80
@@ -289,6 +302,9 @@ def _build_layout(cfg):
         f"Output dev: {_bounce(output_full, output_name_w, 'output')}",# 4. Output dev
         f"Last audio WH: {_fmt(aw)}",    # 5. Last audio WH
         f"Last text WH: {_fmt(tw)}",     # 6. Last text WH
+        f"Msgs: rec={msgs_received} speak={msgs_spoken} ign={msgs_ignored}",  # message counters
+        f"Listener: {listener_health} ({endpoint_path})",  # listener endpoint + health
+        f"IP: {host_ip}",
         f"Dev errs: {status.get('device_errors',0)} | Recov: {status.get('device_recoveries',0)}", # 7. device stats
         f"Failed uploads: {f_uploads}",  # (extra)
         f"Last dev err: {status.get('last_device_error','-') or '-'}", # (extra)
@@ -1240,6 +1256,26 @@ def start_webhook_listener(cfg):
     health_path = listener_cfg.get("health_endpoint", "/health")
 
     log(f"🌐 Initializing webhook listener on {host}:{port}{endpoint} (health: {health_path})")
+    # Record endpoint path and attempt host IP resolution (best-effort)
+    with status_lock:
+        status['endpoint_path'] = endpoint
+        try:
+            import socket
+            if host in ("0.0.0.0", "::"):
+                # Determine primary local IP (best effort)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(('8.8.8.8', 80))
+                    ip = s.getsockname()[0]
+                except Exception:
+                    ip = '127.0.0.1'
+                finally:
+                    s.close()
+                status['host_ip'] = ip
+            else:
+                status['host_ip'] = host
+        except Exception:
+            status['host_ip'] = host
 
     @app.route(endpoint, methods=["POST"])
     def handle_response():
@@ -1254,12 +1290,22 @@ def start_webhook_listener(cfg):
             except Exception:
                 text = ""
         if not text.strip():
+            with status_lock:
+                status['msgs_received'] += 1
+                status['msgs_ignored'] += 1
             return jsonify({"status": "ignored", "reason": "blank text"}), 204
         original_text = text
         cleaned = cleanup_text(original_text)
         log(f"📥 Received text: {original_text}")
+        with status_lock:
+            status['msgs_received'] += 1
         if cleaned:
             speak_text(cleaned)
+            with status_lock:
+                status['msgs_spoken'] += 1
+        else:
+            with status_lock:
+                status['msgs_ignored'] += 1
         return jsonify({"status": "success", "message": "Spoken"}), 200
 
     @app.route(health_path, methods=["GET"])
@@ -1297,7 +1343,12 @@ def start_webhook_listener(cfg):
                         log("♻️ Retrying listener with waitress WSGI server...")
                         try:
                             from waitress import serve  # type: ignore
-                            threading.Thread(target=lambda: serve(app, host=host, port=port), daemon=True).start()
+                            def _serve_waitress():
+                                with status_lock:
+                                    # Mark as attempting (will be confirmed by health thread soon or assumed ok)
+                                    status['listener_health'] = 'ok'
+                                serve(app, host=host, port=port)
+                            threading.Thread(target=_serve_waitress, daemon=True).start()
                         except Exception as we:
                             log(f"❌ Waitress fallback failed: {we}")
             except Exception:
@@ -1313,10 +1364,16 @@ def start_webhook_listener(cfg):
                 r = requests.get(url, timeout=2)
                 if r.status_code == 200:
                     log("✅ Webhook listener health OK")
+                    with status_lock:
+                        status['listener_health'] = 'ok'
                 else:
                     log(f"⚠️ Health check non-200: {r.status_code}")
+                    with status_lock:
+                        status['listener_health'] = 'fail'
             except Exception as e:
                 log(f"⚠️ Health check failed: {e}")
+                with status_lock:
+                    status['listener_health'] = 'fail'
         threading.Thread(target=_self_test, daemon=True).start()
 
 
